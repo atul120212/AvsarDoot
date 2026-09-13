@@ -1,9 +1,10 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -104,24 +105,31 @@ async def lifespan(_app: FastAPI):
     Base.metadata.create_all(bind=engine)
     migrate_schema()
     ensure_admin()
-    scheduler.add_job(deadline_job, "interval", hours=6, id="deadlines", replace_existing=True)
-    scheduler.add_job(scraper_job, "interval", hours=12, id="scrapers", replace_existing=True)
-    # Telegram polling — runs every 6 seconds to process bot messages locally
-    if settings.telegram_bot_token:
-        from app.routers.telegram import telegram_poll_job
-        scheduler.add_job(
-            telegram_poll_job,
-            "interval",
-            seconds=6,
-            id="telegram_poll",
-            replace_existing=True,
-            coalesce=True,
-            max_instances=1,
-        )
-        log.info("Telegram polling started for bot @%s", settings.telegram_bot_username)
-    scheduler.start()
+
+    is_serverless = bool(os.environ.get("VERCEL"))
+    if is_serverless:
+        log.info("Running in Vercel Serverless environment. Background thread scheduler disabled; scheduled tasks handled via Vercel Crons (/cron/*).")
+    else:
+        scheduler.add_job(deadline_job, "interval", hours=6, id="deadlines", replace_existing=True)
+        scheduler.add_job(scraper_job, "interval", hours=12, id="scrapers", replace_existing=True)
+        if settings.telegram_bot_token:
+            from app.routers.telegram import telegram_poll_job
+            scheduler.add_job(
+                telegram_poll_job,
+                "interval",
+                seconds=6,
+                id="telegram_poll",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            log.info("Telegram polling started for bot @%s", settings.telegram_bot_username)
+        scheduler.start()
+
     yield
-    scheduler.shutdown(wait=False)
+
+    if not is_serverless:
+        scheduler.shutdown(wait=False)
 
 
 
@@ -133,12 +141,20 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", settings.frontend_url],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        settings.frontend_url,
+    ],
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Root routes (legacy/direct hosting)
 app.include_router(auth.router)
 app.include_router(profile.router)
 app.include_router(opportunities.router)
@@ -146,7 +162,50 @@ app.include_router(admin.router)
 app.include_router(subscription.router)
 app.include_router(telegram.router)
 
+# Unified /api routes (for Vercel serverless /api/* rewrites)
+api_router = APIRouter(prefix="/api")
+api_router.include_router(auth.router)
+api_router.include_router(profile.router)
+api_router.include_router(opportunities.router)
+api_router.include_router(admin.router)
+api_router.include_router(subscription.router)
+api_router.include_router(telegram.router)
+app.include_router(api_router)
+
 
 @app.get("/health")
+@app.get("/api/health")
 def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+    return {
+        "ok": True,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "env": "vercel" if os.environ.get("VERCEL") else "local",
+    }
+
+
+def _verify_cron_auth(authorization: str | None = Header(None)):
+    cron_secret = os.environ.get("CRON_SECRET")
+    if cron_secret:
+        expected = f"Bearer {cron_secret}"
+        if authorization != expected:
+            raise HTTPException(401, "Invalid Cron Secret")
+
+
+@app.get("/cron/scrapers")
+@app.get("/api/cron/scrapers")
+def run_cron_scrapers(authorization: str | None = Header(None)):
+    """Triggered periodically by Vercel Cron to scrape Indian recruitment sources."""
+    _verify_cron_auth(authorization)
+    scraper_job()
+    return {"ok": True, "task": "scrapers", "triggered_at": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/cron/deadlines")
+@app.get("/api/cron/deadlines")
+def run_cron_deadlines(authorization: str | None = Header(None)):
+    """Triggered periodically by Vercel Cron to send deadline reminders."""
+    _verify_cron_auth(authorization)
+    deadline_job()
+    return {"ok": True, "task": "deadlines", "triggered_at": datetime.now(timezone.utc).isoformat()}
+
+

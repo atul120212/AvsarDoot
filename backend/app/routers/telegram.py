@@ -153,6 +153,20 @@ def _bot_api(method: str, payload: dict) -> dict:
     return resp.json()
 
 
+@router.post("/setup-webhook")
+def setup_telegram_webhook(webhook_url: str | None = None):
+    """
+    Configure the Telegram bot webhook for Vercel production deployment.
+    If webhook_url is not provided, defaults to {frontend_url}/api/telegram/webhook.
+    """
+    if not settings.telegram_bot_token:
+        raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN is not configured.")
+    target_url = webhook_url or f"{settings.frontend_url.rstrip('/')}/api/telegram/webhook"
+    res = _bot_api("setWebhook", {"url": target_url})
+    return {"ok": res.get("ok", False), "result": res, "target_url": target_url}
+
+
+
 # ── webhook ────────────────────────────────────────────────────────────────────
 
 @router.post("/webhook", include_in_schema=False)
